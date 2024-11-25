@@ -3,15 +3,21 @@ const sqlite3 = require('sqlite3').verbose(); // Manejo de base de datos SQLite
 const axios = require('axios'); // Para solicitudes HTTP (Ubidots)
 const path = require('path');
 const cors = require('cors');
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcrypt');
+const { authenticateToken } = require('./middlewares/authenticateToken'); // Importar middleware
 
 const app = express();
 const db = new sqlite3.Database('./database.sqlite'); // Base de datos SQLite
 
 // Configuración de Ubidots
-const UBIDOTS_TOKEN = "BBUS-hj17WuRYMbwTWeHtNkWPfABOfYNGbS"; // Reemplazar con tu token real
+const UBIDOTS_TOKEN = "BBUS-hj17WuRYMbwTWeHtNkWPfABOfYNGbS";
 const UBIDOTS_BASE_URL = "https://industrial.api.ubidots.com/api/v1.6/variables";
 const TEMPERATURE_VAR_ID = "6726a235a32aed34c2227c63"; // ID de "temperature"
 const DISTANCE_VAR_ID = "6726a24b77443131b79bf278"; // ID de "distance"
+
+// Clave secreta para JWT
+const JWT_SECRET = "TuClaveSuperSecreta"; // Cambiar por una clave fuerte y guardar en .env
 
 // Middleware
 app.use(cors());
@@ -46,10 +52,11 @@ db.serialize(() => {
   // Crear usuario admin si no existe
   db.get("SELECT * FROM users WHERE usuario = 'admin'", (err, row) => {
     if (!row) {
+      const hashedPassword = bcrypt.hashSync('admin123', 10);
       db.run(`
         INSERT INTO users (nombre, apellido, correo, usuario, contraseña, rol)
-        VALUES ('Admin', 'System', 'admin@pecerapp.com', 'admin', 'admin123', 'admin')
-      `, (err) => {
+        VALUES ('Admin', 'System', 'admin@pecerapp.com', 'admin', ?, 'admin')
+      `, [hashedPassword], (err) => {
         if (err) console.error('Error al crear usuario admin:', err);
         else console.log('Usuario admin creado con éxito.');
       });
@@ -57,13 +64,13 @@ db.serialize(() => {
   });
 });
 
-// Ruta principal para servir home.html
+// Ruta principal para home.html
 app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'home.html'));
 });
 
 // Ruta para obtener datos de Ubidots
-app.get('/peceras/data', async (req, res) => {
+app.get('/peceras/data', authenticateToken, async (req, res) => {
   try {
     const [temperatureResponse, distanceResponse] = await Promise.all([
       axios.get(`${UBIDOTS_BASE_URL}/${TEMPERATURE_VAR_ID}`, {
@@ -76,8 +83,6 @@ app.get('/peceras/data', async (req, res) => {
 
     const temperature = temperatureResponse.data.last_value.value;
     const distance = distanceResponse.data.last_value.value;
-
-    console.log(`[PECERAS DATA] -> Temperature: ${temperature}°C, Distance: ${distance}cm`);
 
     res.json({
       variables: [
@@ -96,50 +101,66 @@ app.post('/login', (req, res) => {
   const { usuario, contraseña } = req.body;
 
   db.get(
-    `SELECT * FROM users WHERE usuario = ? AND contraseña = ?`,
-    [usuario, contraseña],
-    (err, user) => {
+    `SELECT * FROM users WHERE usuario = ?`,
+    [usuario],
+    async (err, user) => {
       if (err) {
         console.error('Error al buscar usuario:', err);
         return res.status(500).json({ error: 'Error en el servidor' });
       }
 
-      if (!user) {
+      if (!user || !(await bcrypt.compare(contraseña, user.contraseña))) {
         return res.status(401).json({ error: 'Usuario o contraseña incorrectos' });
       }
 
+      const token = jwt.sign(
+        { userId: user.id, nombre: user.nombre, rol: user.rol },
+        JWT_SECRET,
+        { expiresIn: '2h' }
+      );
+
       res.json({
-        userId: user.id,
-        nombre: user.nombre,
-        rol: user.rol,
+        message: 'Login exitoso',
+        token,
       });
     }
   );
 });
 
 // Ruta para registro
-app.post('/register', (req, res) => {
+app.post('/register', async (req, res) => {
   const { nombre, apellido, correo, usuario, contraseña } = req.body;
 
-  db.run(
-    `INSERT INTO users (nombre, apellido, correo, usuario, contraseña, rol) VALUES (?, ?, ?, ?, ?, 'user')`,
-    [nombre, apellido, correo, usuario, contraseña],
-    function (err) {
-      if (err) {
-        console.error('Error al registrar usuario:', err);
-        return res.status(400).json({ error: 'Usuario o correo ya existe.' });
-      }
+  try {
+    const hashedPassword = await bcrypt.hash(contraseña, 10);
 
-      res.json({
-        message: 'Registro exitoso',
-        userId: this.lastID,
-      });
-    }
-  );
+    db.run(
+      `INSERT INTO users (nombre, apellido, correo, usuario, contraseña, rol) VALUES (?, ?, ?, ?, ?, 'user')`,
+      [nombre, apellido, correo, usuario, hashedPassword],
+      function (err) {
+        if (err) {
+          console.error('Error al registrar usuario:', err);
+          return res.status(400).json({ error: 'Usuario o correo ya existe.' });
+        }
+
+        res.json({
+          message: 'Registro exitoso',
+          userId: this.lastID,
+        });
+      }
+    );
+  } catch (err) {
+    console.error('Error al registrar usuario:', err);
+    res.status(500).json({ error: 'Error en el servidor' });
+  }
 });
 
 // Ruta para obtener usuarios (solo admin)
-app.get('/admin/users', (req, res) => {
+app.get('/admin/users', authenticateToken, (req, res) => {
+  if (req.user.rol !== 'admin') {
+    return res.status(403).json({ error: 'Acceso denegado' });
+  }
+
   db.all(`SELECT id, nombre, apellido, correo, usuario, rol FROM users`, [], (err, rows) => {
     if (err) {
       console.error('Error al obtener usuarios:', err);
@@ -151,7 +172,11 @@ app.get('/admin/users', (req, res) => {
 });
 
 // Ruta para eliminar usuario (solo admin)
-app.delete('/admin/users/:id', (req, res) => {
+app.delete('/admin/users/:id', authenticateToken, (req, res) => {
+  if (req.user.rol !== 'admin') {
+    return res.status(403).json({ error: 'Acceso denegado' });
+  }
+
   const userId = req.params.id;
 
   db.run(`DELETE FROM users WHERE id = ?`, [userId], function (err) {
@@ -169,3 +194,4 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Servidor corriendo en http://localhost:${PORT}`);
 });
+
